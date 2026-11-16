@@ -345,6 +345,9 @@ func (store *Store) LoadPlainFile(in []byte) (sops.TreeBranches, error) {
 // EmitEncryptedFile returns the encrypted bytes of the json file corresponding to a
 // sops.Tree runtime object
 func (store *Store) EmitEncryptedFile(in sops.Tree) ([]byte, error) {
+	if sops.HasAnchors(in.Branches) {
+		return nil, stores.ErrAnchorsNotSupported
+	}
 	branches, err := stores.SerializeMetadata(in, stores.MetadataOpts{
 		Flatten: stores.MetadataFlattenNone,
 	})
@@ -357,6 +360,12 @@ func (store *Store) EmitEncryptedFile(in sops.Tree) ([]byte, error) {
 // EmitPlainFile returns the plaintext bytes of the json file corresponding to a
 // sops.TreeBranches runtime object
 func (store *Store) EmitPlainFile(in sops.TreeBranches) ([]byte, error) {
+	// JSON has no anchors, so aliases and merge keys are expanded to the values
+	// they refer to, just as a YAML parser would understand them.
+	in, err := sops.ResolveAliases(in)
+	if err != nil {
+		return nil, fmt.Errorf("Error resolving aliases: %s", err)
+	}
 	out, err := store.jsonFromTreeBranch(in[0])
 	if err != nil {
 		return nil, fmt.Errorf("Error marshaling to json: %s", err)
@@ -368,6 +377,11 @@ func (store *Store) EmitPlainFile(in sops.TreeBranches) ([]byte, error) {
 // EmitValue returns bytes corresponding to a single encoded value
 // in a generic interface{} object
 func (store *Store) EmitValue(v interface{}) ([]byte, error) {
+	// A single extracted value (e.g. from --extract) may still carry anchors.
+	v, err := sops.ResolveValue(v)
+	if err != nil {
+		return nil, fmt.Errorf("Error resolving aliases: %s", err)
+	}
 	s, err := store.encodeValue(v)
 	if err != nil {
 		return nil, err

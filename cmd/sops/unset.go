@@ -52,6 +52,10 @@ func unset(opts unsetOpts) ([]byte, error) {
 	}
 	tree.Branches[0] = newBranch
 
+	if err := common.PrepareTreeForStore(tree, opts.OutputStore); err != nil {
+		return nil, common.NewExitError(fmt.Sprintf("Could not marshal tree: %s", err), codes.ErrorDumpingTree)
+	}
+
 	err = common.EncryptTree(common.EncryptTreeOpts{
 		DataKey: dataKey, Tree: tree, Cipher: opts.Cipher,
 	})

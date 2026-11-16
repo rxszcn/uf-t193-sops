@@ -77,6 +77,15 @@ func extract(tree *sops.Tree, path []interface{}, outputStore sops.Store) (outpu
 	if err != nil {
 		return nil, fmt.Errorf("error truncating tree: %s", err)
 	}
+	// The extracted subtree is emitted as a standalone document, so anchoring
+	// has to be resolved: an alias in the subtree may refer to an anchor of the
+	// source document that is not part of the output. This also matches the
+	// behaviour before anchors were preserved, when aliases were expanded while
+	// loading and extract therefore always saw plain values.
+	v, err = sops.ResolveValueIn(tree.Branches[0], v)
+	if err != nil {
+		return nil, common.NewExitError(fmt.Sprintf("Error resolving aliases: %s", err), codes.ErrorDumpingTree)
+	}
 	if newBranch, ok := v.(sops.TreeBranch); ok {
 		tree.Branches[0] = newBranch
 		decrypted, err := outputStore.EmitPlainFile(tree.Branches)

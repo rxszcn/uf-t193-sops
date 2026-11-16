@@ -162,6 +162,9 @@ func (store *Store) LoadPlainFile(in []byte) (sops.TreeBranches, error) {
 // EmitEncryptedFile returns encrypted INI file bytes corresponding to a sops.Tree
 // runtime object
 func (store *Store) EmitEncryptedFile(in sops.Tree) ([]byte, error) {
+	if sops.HasAnchors(in.Branches) {
+		return nil, stores.ErrAnchorsNotSupported
+	}
 	branches, err := stores.SerializeMetadata(in, stores.MetadataOpts{
 		Flatten:        stores.MetadataFlattenBelowTop,
 		EscapeNewlines: true,
@@ -172,8 +175,12 @@ func (store *Store) EmitEncryptedFile(in sops.Tree) ([]byte, error) {
 	return store.EmitPlainFile(branches)
 }
 
-// EmitPlainFile returns the plaintext INI file bytes corresponding to a sops.TreeBranches object
+// EmitPlainFile returns the plaintext INI file bytes corresponding to an sops.TreeBranches object
 func (store *Store) EmitPlainFile(in sops.TreeBranches) ([]byte, error) {
+	in, err := sops.ResolveAliases(in)
+	if err != nil {
+		return nil, fmt.Errorf("Error resolving aliases: %s", err)
+	}
 	out, err := store.iniFromTreeBranches(in)
 	if err != nil {
 		return nil, fmt.Errorf("Error marshaling to INI: %s", err)

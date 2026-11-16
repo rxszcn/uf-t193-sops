@@ -10,6 +10,7 @@ of the purpose of this package is to make it easy to change the SOPS file format
 package stores
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -29,6 +30,12 @@ const (
 	// SopsMetadataKey is the key used to store SOPS metadata at in SOPS encrypted files.
 	SopsMetadataKey = "sops"
 )
+
+// ErrAnchorsNotSupported is returned when a tree that still contains YAML
+// anchors, aliases or merge keys is written to a format that cannot express
+// them. Emitting it would either fail or duplicate ciphertext, so the
+// conversion is refused instead.
+var ErrAnchorsNotSupported = errors.New("this format cannot represent YAML anchors, aliases or merge keys; use YAML to keep them, or convert the plaintext document")
 
 // Metadata is stored in SOPS encrypted files, and it contains the information necessary to decrypt the file.
 // This struct is just used for serialization, and SOPS uses another struct internally, sops.Metadata. It exists

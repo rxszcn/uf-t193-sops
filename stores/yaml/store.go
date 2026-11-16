@@ -28,6 +28,14 @@ func (store *Store) Name() string {
 	return "yaml"
 }
 
+// SupportsAnchors reports that YAML can represent anchors, aliases and merge
+// keys, so trees loaded from YAML keep them as references. The CLI uses this to
+// decide whether a tree has to be resolved before being written to another
+// format.
+func (store *Store) SupportsAnchors() bool {
+	return true
+}
+
 func (store Store) appendCommentToList(comment string, list []interface{}) []interface{} {
 	return store.appendCommentToListWithInline(comment, list, false)
 }
@@ -75,7 +83,31 @@ func (store Store) appendCommentToMapWithInline(comment string, branch sops.Tree
 	return branch
 }
 
+// isMergeKeyNode reports whether the node is the unquoted "<<" merge key.
+// The YAML parser tags an unquoted "<<" with "!!merge", while a quoted "<<" is
+// a regular string key, which is why the tag (and not just the value) matters.
+func isMergeKeyNode(node *yaml.Node) bool {
+	return node.Kind == yaml.ScalarNode && node.ShortTag() == "!!merge"
+}
+
 func (store Store) nodeToTreeValue(node *yaml.Node, commentsWereHandled bool) (interface{}, error) {
+	// An alias is a reference to an anchor defined earlier in the document and
+	// must be preserved as such; expanding it here would turn the reference into
+	// an independent copy that no longer follows later changes to the anchor.
+	if node.Kind == yaml.AliasNode {
+		return sops.Alias{Name: node.Value}, nil
+	}
+	value, err := store.nodeContentToTreeValue(node, commentsWereHandled)
+	if err != nil {
+		return nil, err
+	}
+	if node.Anchor != "" {
+		return sops.Anchor{Name: node.Anchor, Value: value}, nil
+	}
+	return value, nil
+}
+
+func (store Store) nodeContentToTreeValue(node *yaml.Node, commentsWereHandled bool) (interface{}, error) {
 	switch node.Kind {
 	case yaml.DocumentNode:
 		panic("documents should never be passed here")
@@ -106,8 +138,6 @@ func (store Store) nodeToTreeValue(node *yaml.Node, commentsWereHandled bool) (i
 		var result interface{}
 		node.Decode(&result)
 		return result, nil
-	case yaml.AliasNode:
-		return store.nodeToTreeValue(node.Alias, false)
 	}
 	return nil, nil
 }
@@ -140,7 +170,13 @@ func (store Store) appendYamlNodeToTreeBranch(node *yaml.Node, branch sops.TreeB
 				branch = store.appendInlineCommentToMap(value.LineComment, branch)
 			}
 			var keyValue interface{}
-			key.Decode(&keyValue)
+			if isMergeKeyNode(key) {
+				// Keep "<<" distinct from a literal string key so that emitting
+				// does not quote it and merge semantics are preserved.
+				keyValue = sops.MergeKey{}
+			} else {
+				key.Decode(&keyValue)
+			}
 			valueTV, err := store.nodeToTreeValue(value, handleValueComments)
 			if err != nil {
 				return nil, err
@@ -161,11 +197,9 @@ func (store Store) appendYamlNodeToTreeBranch(node *yaml.Node, branch sops.TreeB
 		}
 		return nil, fmt.Errorf("YAML documents that are values are not supported")
 	case yaml.AliasNode:
-		branch, err = store.appendYamlNodeToTreeBranch(node.Alias, branch, false)
-		if err != nil {
-			// This should never happen since node.Alias was already successfully decoded before
-			return nil, err
-		}
+		// Aliases are handled by nodeToTreeValue before this function is
+		// reached, so a document whose root is an alias cannot occur.
+		return nil, fmt.Errorf("YAML documents that are aliases are not supported")
 	}
 	if !commentsWereHandled {
 		branch = store.appendCommentToMap(node.FootComment, branch)
@@ -226,11 +260,40 @@ func (store *Store) treeValueToNode(in interface{}) *yaml.Node {
 		sequence.Kind = yaml.SequenceNode
 		store.appendSequence(in, sequence)
 		return sequence
+	case sops.Anchor:
+		valueNode := store.treeValueToNode(in.Value)
+		valueNode.Anchor = in.Name
+		return valueNode
+	case sops.Alias:
+		var aliasNode = &yaml.Node{}
+		aliasNode.Kind = yaml.AliasNode
+		aliasNode.Value = in.Name
+		return aliasNode
 	default:
 		var valueNode = &yaml.Node{}
 		valueNode.Encode(in)
 		return valueNode
 	}
+}
+
+// keyToNode renders a mapping key. A merge key must be written as a plain
+// (unquoted) "<<", whereas a literal string key with the same text has to be
+// quoted so YAML does not interpret it as a merge key.
+func (store *Store) keyToNode(in interface{}) *yaml.Node {
+	var keyNode = &yaml.Node{}
+	if _, ok := in.(sops.MergeKey); ok {
+		keyNode.Kind = yaml.ScalarNode
+		keyNode.Value = "<<"
+		return keyNode
+	}
+	keyNode.Encode(in)
+	if s, ok := in.(string); ok && s == "<<" {
+		// Encode tags the value as "!!merge"; clear the tag and quote the
+		// scalar so the parser reads it back as a literal string key.
+		keyNode.Tag = ""
+		keyNode.Style = yaml.DoubleQuotedStyle
+	}
+	return keyNode
 }
 
 func (store *Store) appendSequence(in []interface{}, sequence *yaml.Node) {
@@ -265,6 +328,60 @@ func (store *Store) appendSequence(in []interface{}, sequence *yaml.Node) {
 	}
 }
 
+// validateMergeKeys checks that every merge key holds something YAML accepts:
+// a mapping, a reference to one, or a sequence of those. An arbitrary value
+// would be written out as invalid YAML that cannot be parsed again, so it is
+// rejected before anything is emitted.
+func validateMergeKeys(value interface{}) error {
+	switch value := value.(type) {
+	case sops.Anchor:
+		return validateMergeKeys(value.Value)
+	case sops.TreeBranch:
+		for _, item := range value {
+			if _, isMerge := item.Key.(sops.MergeKey); isMerge {
+				if err := validateMergeKeyValue(item.Value); err != nil {
+					return err
+				}
+			}
+			if err := validateMergeKeys(item.Value); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []interface{}:
+		for _, item := range value {
+			if err := validateMergeKeys(item); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+func validateMergeKeyValue(value interface{}) error {
+	switch value := value.(type) {
+	case sops.Alias:
+		return nil
+	case sops.Anchor:
+		return validateMergeKeyValue(value.Value)
+	case sops.TreeBranch:
+		return nil
+	case []interface{}:
+		for _, item := range value {
+			switch item.(type) {
+			case sops.Alias, sops.Anchor, sops.TreeBranch:
+			default:
+				return fmt.Errorf("a merge key (<<) requires a mapping or a sequence of mappings, got %T in the sequence", item)
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("a merge key (<<) requires a mapping or a sequence of mappings, got %T", value)
+	}
+}
+
 func (store *Store) appendTreeBranch(branch sops.TreeBranch, mapping *yaml.Node) {
 	var headComments []string
 	var inlineComments []string
@@ -281,8 +398,7 @@ func (store *Store) appendTreeBranch(branch sops.TreeBranch, mapping *yaml.Node)
 				headComments = store.addCommentsHead(mapping, headComments)
 				beginning = false
 			}
-			var keyNode = &yaml.Node{}
-			keyNode.Encode(item.Key)
+			var keyNode = store.keyToNode(item.Key)
 			headComments = store.addCommentsHead(keyNode, headComments)
 			valueNode := store.treeValueToNode(item.Value)
 			inlineComments = store.addCommentsLine(valueNode, inlineComments)
@@ -373,6 +489,17 @@ func (store *Store) EmitEncryptedFile(in sops.Tree) ([]byte, error) {
 // EmitPlainFile returns the plaintext bytes of the yaml file corresponding to a
 // sops.TreeBranches runtime object
 func (store *Store) EmitPlainFile(branches sops.TreeBranches) ([]byte, error) {
+	// An alias with no anchor defined before it produces a document that
+	// cannot be parsed again, so refuse to write one. Likewise a merge key
+	// holding anything but a mapping would be invalid YAML.
+	if err := sops.ValidateAnchors(branches); err != nil {
+		return nil, err
+	}
+	for _, branch := range branches {
+		if err := validateMergeKeys(branch); err != nil {
+			return nil, err
+		}
+	}
 	var b bytes.Buffer
 	e := yaml.NewEncoder(io.Writer(&b))
 	indent, err := store.getIndentation()
@@ -403,7 +530,15 @@ func (store *Store) EmitPlainFile(branches sops.TreeBranches) ([]byte, error) {
 // EmitValue returns bytes corresponding to a single encoded value
 // in a generic interface{} object
 func (store *Store) EmitValue(v interface{}) ([]byte, error) {
-	n := store.treeValueToNode(v)
+	// An extracted value is written as a standalone document, which cannot hold
+	// an alias pointing at an anchor defined elsewhere in the source document.
+	// Resolving it here yields the same plaintext the pre-anchor-aware code
+	// produced, because aliases used to be expanded while loading.
+	value, err := sops.ResolveValue(v)
+	if err != nil {
+		return nil, fmt.Errorf("Error resolving aliases: %s", err)
+	}
+	n := store.treeValueToNode(value)
 	return yaml.Marshal(n)
 }
 

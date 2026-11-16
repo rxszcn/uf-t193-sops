@@ -74,6 +74,9 @@ func rotate(opts rotateOpts) ([]byte, error) {
 	}
 
 	// Reencrypt the file with the new key
+	if err := common.PrepareTreeForStore(tree, opts.OutputStore); err != nil {
+		return nil, common.NewExitError(fmt.Sprintf("Could not marshal tree: %s", err), codes.ErrorDumpingTree)
+	}
 	err = common.EncryptTree(common.EncryptTreeOpts{
 		DataKey: dataKey, Tree: tree, Cipher: opts.Cipher,
 	})

@@ -205,6 +205,9 @@ func editTreeImpl(tmpfile *os.File, tmpfileName string, opts editOpts, tree *sop
 	}
 
 	// Encrypt the file
+	if err := common.PrepareTreeForStore(tree, opts.OutputStore); err != nil {
+		return createError(common.NewExitError(fmt.Sprintf("Could not marshal tree: %s", err), codes.ErrorDumpingTree))
+	}
 	err = common.EncryptTree(common.EncryptTreeOpts{
 		DataKey: dataKey, Tree: tree, Cipher: opts.Cipher,
 	})

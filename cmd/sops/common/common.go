@@ -117,6 +117,31 @@ type EncryptTreeOpts struct {
 	DataKey []byte
 }
 
+// SupportsAnchors reports whether a store can represent YAML anchors, aliases
+// and merge keys. Only the YAML store can.
+func SupportsAnchors(store sops.Store) bool {
+	s, ok := store.(interface{ SupportsAnchors() bool })
+	return ok && s.SupportsAnchors()
+}
+
+// PrepareTreeForStore resolves YAML anchors, aliases and merge keys in the tree
+// when the target store cannot express them, so that converting a document to
+// another format keeps working. The resolution happens before encryption, which
+// means the ciphertext is repeated at every use, mirroring what the older
+// snapshot behaviour produced. When the target store is YAML the tree is left
+// untouched and the reference structure is preserved.
+func PrepareTreeForStore(tree *sops.Tree, store sops.Store) error {
+	if SupportsAnchors(store) || !sops.HasAnchors(tree.Branches) {
+		return nil
+	}
+	resolved, err := sops.ResolveAliases(tree.Branches)
+	if err != nil {
+		return fmt.Errorf("could not resolve YAML anchors for output format: %w", err)
+	}
+	tree.Branches = resolved
+	return nil
+}
+
 // EncryptTree encrypts the tree passed in through the EncryptTreeOpts
 func EncryptTree(opts EncryptTreeOpts) error {
 	unencryptedMac, err := opts.Tree.Encrypt(opts.DataKey, opts.Cipher)

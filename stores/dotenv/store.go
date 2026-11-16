@@ -75,6 +75,9 @@ func (store *Store) LoadPlainFile(in []byte) (sops.TreeBranches, error) {
 // EmitEncryptedFile returns the encrypted file's bytes corresponding to a sops
 // runtime object
 func (store *Store) EmitEncryptedFile(in sops.Tree) ([]byte, error) {
+	if sops.HasAnchors(in.Branches) {
+		return nil, stores.ErrAnchorsNotSupported
+	}
 	branches, err := stores.SerializeMetadata(in, stores.MetadataOpts{
 		Flatten: stores.MetadataFlattenFull,
 	})
@@ -87,6 +90,10 @@ func (store *Store) EmitEncryptedFile(in sops.Tree) ([]byte, error) {
 // EmitPlainFile returns the plaintext file's bytes corresponding to a sops
 // runtime object
 func (store *Store) EmitPlainFile(in sops.TreeBranches) ([]byte, error) {
+	in, err := sops.ResolveAliases(in)
+	if err != nil {
+		return nil, fmt.Errorf("Error resolving aliases: %s", err)
+	}
 	buffer := bytes.Buffer{}
 	for _, item := range in[0] {
 		if stores.IsComplexValue(item.Value) {

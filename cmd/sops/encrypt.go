@@ -127,6 +127,12 @@ func encrypt(opts encryptOpts) (encryptedFile []byte, err error) {
 		return nil, err
 	}
 
+	// Converting a document to a format without anchors has to happen before
+	// encryption, because each alias has to be encrypted where it is used.
+	if err := common.PrepareTreeForStore(&tree, opts.OutputStore); err != nil {
+		return nil, common.NewExitError(fmt.Sprintf("Could not marshal tree: %s", err), codes.ErrorDumpingTree)
+	}
+
 	err = common.EncryptTree(common.EncryptTreeOpts{
 		DataKey: dataKey,
 		Tree:    &tree,

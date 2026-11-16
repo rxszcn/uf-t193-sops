@@ -55,6 +55,12 @@ func set(opts setOpts) ([]byte, bool, error) {
 		return nil, false, common.NewExitError(err, code)
 	}
 
+	// Writing to a format without anchors means each alias has to carry its own
+	// encrypted value, so resolve them before encrypting.
+	if err := common.PrepareTreeForStore(tree, opts.OutputStore); err != nil {
+		return nil, false, common.NewExitError(fmt.Sprintf("Could not marshal tree: %s", err), codes.ErrorDumpingTree)
+	}
+
 	err = common.EncryptTree(common.EncryptTreeOpts{
 		DataKey: dataKey, Tree: tree, Cipher: opts.Cipher,
 	})

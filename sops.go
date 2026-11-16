@@ -115,6 +115,32 @@ type Comment struct {
 	Inline bool
 }
 
+// Anchor represents a value that is defined with a YAML anchor. The Value is the
+// anchored content itself; Name is the anchor's name without the leading "&".
+//
+// Anchors are preserved by the YAML store so that the structure of documents
+// using anchors and aliases survives a load/encrypt/decrypt/emit round trip.
+// Other file formats have no concept of anchors, so they resolve them on emit
+// (see ResolveAliases).
+type Anchor struct {
+	Name  string
+	Value interface{}
+}
+
+// Alias is a reference to a YAML anchor defined elsewhere in the same document.
+// It carries no value of its own: the referenced anchor's Value is the data.
+// Because the alias is a reference and not a copy, its content must not be
+// encrypted independently of the anchor definition.
+type Alias struct {
+	Name string
+}
+
+// MergeKey is the key of a YAML merge entry, written as "<<" without quotes.
+// Its value is either an Alias, a sequence of Aliases, or an inline mapping.
+// Keeping it as a distinct key type preserves merge semantics (a reference)
+// instead of baking the merged mapping into the document.
+type MergeKey struct{}
+
 // TreeItem is an item inside sops's tree
 type TreeItem struct {
 	Key   interface{}
@@ -159,6 +185,21 @@ func equals(oneBranch interface{}, otherBranch interface{}) bool {
 			return false
 		}
 		return oneBranch.Value == otherBranch.Value
+	case Anchor:
+		otherBranch, ok := otherBranch.(Anchor)
+		if !ok {
+			return false
+		}
+		return oneBranch.Name == otherBranch.Name && equals(oneBranch.Value, otherBranch.Value)
+	case Alias:
+		otherBranch, ok := otherBranch.(Alias)
+		if !ok {
+			return false
+		}
+		return oneBranch.Name == otherBranch.Name
+	case MergeKey:
+		_, ok := otherBranch.(MergeKey)
+		return ok
 	default:
 		// Unexpected type
 		return oneBranch == otherBranch
@@ -199,17 +240,38 @@ func valueFromPathAndLeaf(path []interface{}, leaf interface{}) interface{} {
 	}
 }
 
-func set(branch interface{}, path []interface{}, value interface{}) (interface{}, bool) {
+// MergeKeyName is the YAML spelling of a merge key. It is used when matching a
+// path component against a MergeKey, so that scripts addressing the key as "<<"
+// keep working, and when writing it into AAD paths for compatibility.
+const MergeKeyName = "<<"
+
+// keysMatch reports whether a path component addresses the given tree key. A
+// merge key is matched by its YAML spelling so that a path like
+// ["defaults", "<<"] addresses it rather than adding a second, literal key.
+func keysMatch(key interface{}, pathComponent interface{}) bool {
+	if key == pathComponent {
+		return true
+	}
+	if _, isMergeKey := key.(MergeKey); isMergeKey {
+		return pathComponent == MergeKeyName
+	}
+	if _, isMergeKey := pathComponent.(MergeKey); isMergeKey {
+		return key == MergeKeyName
+	}
+	return false
+}
+
+func set(root TreeBranch, branch interface{}, path []interface{}, value interface{}) (interface{}, bool) {
 	switch branch := branch.(type) {
 	case TreeBranch:
 		for i, item := range branch {
-			if item.Key == path[0] {
+			if keysMatch(item.Key, path[0]) {
 				var changed bool
 				if len(path) == 1 {
 					changed = !equals(branch[i].Value, value)
 					branch[i].Value = value
 				} else {
-					branch[i].Value, changed = set(item.Value, path[1:], value)
+					branch[i].Value, changed = set(root, item.Value, path[1:], value)
 				}
 				return branch, changed
 			}
@@ -234,10 +296,30 @@ func set(branch interface{}, path []interface{}, value interface{}) (interface{}
 				branch = append(branch, valueFromPathAndLeaf(path[1:], value))
 				changed = true
 			} else {
-				branch[position], changed = set(branch[position], path[1:], value)
+				branch[position], changed = set(root, branch[position], path[1:], value)
 			}
 		}
 		return branch, changed
+	case Anchor:
+		// An anchor is a transparent wrapper around its content: a path written
+		// through it edits the anchored value, which is what alias users expect.
+		newValue, changed := set(root, branch.Value, path, value)
+		return Anchor{Name: branch.Name, Value: newValue}, changed
+	case Alias:
+		// An alias holds no content of its own; it is another name for the
+		// anchor's value. Writing through it therefore edits the anchor
+		// definition, so the reference is preserved and every other alias sees
+		// the change, instead of detaching this use into an independent copy.
+		if len(path) == 0 {
+			return value, true
+		}
+		found, changed := updateAnchorDefinition(root, branch.Name, func(current interface{}) (interface{}, bool) {
+			return set(root, current, path, value)
+		})
+		if found && changed {
+			return branch, true
+		}
+		return branch, false
 	default:
 		newValue := valueFromPathAndLeaf(path, value)
 		return newValue, !equals(branch, newValue)
@@ -246,19 +328,69 @@ func set(branch interface{}, path []interface{}, value interface{}) (interface{}
 
 // Set sets a value on a given tree for the specified path
 func (branch TreeBranch) Set(path []interface{}, value interface{}) (TreeBranch, bool) {
-	v, changed := set(branch, path, value)
+	v, changed := set(branch, branch, path, value)
 	return v.(TreeBranch), changed
 }
 
-func unset(branch interface{}, path []interface{}) (interface{}, error) {
+// updateAnchorDefinition finds the definition of the named anchor in branch and
+// replaces its content with the result of update. found reports whether an
+// anchor of that name exists; changed reports whether update changed it.
+func updateAnchorDefinition(branch TreeBranch, name string, update func(interface{}) (interface{}, bool)) (found bool, changed bool) {
+	return updateAnchorDefinitionInBranch(branch, name, update)
+}
+
+func updateAnchorDefinitionInBranch(branch TreeBranch, name string, update func(interface{}) (interface{}, bool)) (bool, bool) {
+	for i := range branch {
+		if anchor, ok := branch[i].Value.(Anchor); ok && anchor.Name == name {
+			newValue, changed := update(anchor.Value)
+			if changed {
+				branch[i].Value = Anchor{Name: anchor.Name, Value: newValue}
+			}
+			return true, changed
+		}
+		if found, changed := updateAnchorDefinitionInValue(branch[i].Value, name, update); found {
+			return true, changed
+		}
+	}
+	return false, false
+}
+
+func updateAnchorDefinitionInValue(value interface{}, name string, update func(interface{}) (interface{}, bool)) (bool, bool) {
+	switch value := value.(type) {
+	case Anchor:
+		// The anchor is matched by its parent container, which can update it;
+		// here only its content can contain further anchor definitions.
+		return updateAnchorDefinitionInValue(value.Value, name, update)
+	case TreeBranch:
+		return updateAnchorDefinitionInBranch(value, name, update)
+	case []interface{}:
+		for i := range value {
+			if anchor, ok := value[i].(Anchor); ok && anchor.Name == name {
+				newValue, changed := update(anchor.Value)
+				if changed {
+					value[i] = Anchor{Name: anchor.Name, Value: newValue}
+				}
+				return true, changed
+			}
+			if found, changed := updateAnchorDefinitionInValue(value[i], name, update); found {
+				return true, changed
+			}
+		}
+		return false, false
+	default:
+		return false, false
+	}
+}
+
+func unset(root TreeBranch, branch interface{}, path []interface{}) (interface{}, error) {
 	switch branch := branch.(type) {
 	case TreeBranch:
 		for i, item := range branch {
-			if item.Key == path[0] {
+			if keysMatch(item.Key, path[0]) {
 				if len(path) == 1 {
 					branch = slices.Delete(branch, i, i+1)
 				} else {
-					v, err := unset(item.Value, path[1:])
+					v, err := unset(root, item.Value, path[1:])
 					if err != nil {
 						return nil, err
 					}
@@ -269,20 +401,45 @@ func unset(branch interface{}, path []interface{}) (interface{}, error) {
 		}
 		return nil, &SopsKeyNotFound{Msg: "Key not found: %s", Key: path[0]}
 	case []interface{}:
-		position := path[0].(int)
+		position, ok := path[0].(int)
+		if !ok {
+			return nil, fmt.Errorf("Unsupported path component %v for a list", path[0])
+		}
 		if position >= len(branch) {
 			return nil, &SopsKeyNotFound{Msg: "Index %d out of bounds", Key: path[0]}
 		}
 		if len(path) == 1 {
 			branch = slices.Delete(branch, position, position+1)
 		} else {
-			v, err := unset(branch[position], path[1:])
+			v, err := unset(root, branch[position], path[1:])
 			if err != nil {
 				return nil, err
 			}
 			branch[position] = v
 		}
 		return branch, nil
+	case Anchor:
+		// Removing inside an anchor edits the anchored content, so the anchor
+		// (and therefore every alias to it) stays consistent.
+		v, err := unset(root, branch.Value, path)
+		if err != nil {
+			return nil, err
+		}
+		return Anchor{Name: branch.Name, Value: v}, nil
+	case Alias:
+		// Removing through an alias removes from the anchor definition, so the
+		// reference survives and every alias reflects the removal.
+		found, changed := updateAnchorDefinition(root, branch.Name, func(current interface{}) (interface{}, bool) {
+			v, err := unset(root, current, path)
+			if err != nil {
+				return current, false
+			}
+			return v, true
+		})
+		if found && changed {
+			return branch, nil
+		}
+		return nil, &SopsKeyNotFound{Msg: "Key not found: %s", Key: path[0]}
 	default:
 		return nil, fmt.Errorf("Unsupported type: %T for item '%s'", branch, path[0])
 	}
@@ -290,7 +447,7 @@ func unset(branch interface{}, path []interface{}) (interface{}, error) {
 
 // Unset removes a value on a given tree from the specified path
 func (branch TreeBranch) Unset(path []interface{}) (TreeBranch, error) {
-	v, err := unset(branch, path)
+	v, err := unset(branch, branch, path)
 	if err != nil {
 		return nil, err
 	}
@@ -308,13 +465,28 @@ type Tree struct {
 // Truncate truncates the tree to the path specified
 func (branch TreeBranch) Truncate(path []interface{}) (interface{}, error) {
 	log.WithField("path", path).Info("Truncating tree")
+	// Resolving first turns aliases into their values, so a path can be walked
+	// as if the document had no references. It also gives the correct
+	// "most recent preceding definition" semantics for redefined anchors.
+	resolved, err := ResolveValue(branch)
+	if err != nil {
+		return nil, err
+	}
+	branch, ok := resolved.(TreeBranch)
+	if !ok {
+		return nil, fmt.Errorf("Internal error: resolving a branch produced %T", resolved)
+	}
 	var current interface{} = branch
 	for _, component := range path {
 		switch component := component.(type) {
 		case string:
+			currentBranch, ok := current.(TreeBranch)
+			if !ok {
+				return nil, fmt.Errorf("component ['%s'] not found", component)
+			}
 			found := false
-			for _, item := range current.(TreeBranch) {
-				if item.Key == component {
+			for _, item := range currentBranch {
+				if keysMatch(item.Key, component) {
 					current = item.Value
 					found = true
 					break
@@ -352,6 +524,19 @@ func (branch TreeBranch) walkValue(in interface{}, path []string, commentsStack 
 		return onLeaves(in, path, commentsStack)
 	case Comment:
 		return onLeaves(in, path, commentsStack)
+	case Anchor:
+		// Anchors are structural: the wrapped value is walked (and therefore
+		// encrypted) exactly once, where it is defined. Aliases elsewhere are
+		// left untouched so the same plaintext is not encrypted several times.
+		value, err := branch.walkValue(in.Value, path, commentsStack, onLeaves)
+		if err != nil {
+			return nil, err
+		}
+		return Anchor{Name: in.Name, Value: value}, nil
+	case Alias, MergeKey:
+		// References carry no data of their own and are structural, so they are
+		// neither encrypted nor decrypted nor added to the MAC.
+		return in, nil
 	case TreeBranch:
 		return branch.walkBranch(in, path, commentsStack, onLeaves)
 	case []interface{}:
@@ -426,6 +611,20 @@ func (branch TreeBranch) walkBranch(in TreeBranch, path []string, commentsStack 
 		}
 		key, ok := item.Key.(string)
 		if !ok {
+			if _, isMergeKey := item.Key.(MergeKey); isMergeKey {
+				// The merge key is structural: walk its value (an alias, a
+				// sequence of aliases, or an inline mapping) but keep the key.
+				// "<<" is used in the path to stay compatible with documents
+				// written by versions that stored the merge key as a plain
+				// string key, whose values were authenticated with that path.
+				newV, err := branch.walkValue(item.Value, append(path, MergeKeyName), commentsStack, onLeaves)
+				if err != nil {
+					return nil, err
+				}
+				in[i].Value = newV
+				commentsStack[len(commentsStack)-1] = []string{}
+				continue
+			}
 			return nil, fmt.Errorf(
 				"Tree contains a non-string key (type %T): %s. Only string keys are supported", item.Key, item.Key)
 		}
@@ -532,11 +731,23 @@ func (tree Tree) Encrypt(key []byte, cipher Cipher) (string, error) {
 	audit.SubmitEvent(audit.EncryptEvent{
 		File: tree.FilePath,
 	})
+	for _, mismatch := range FindAnchorEncryptionMismatches(tree) {
+		log.WithFields(logrus.Fields{
+			"anchor": mismatch.AnchorName,
+			"alias":  mismatch.AliasPath,
+		}).Warn(mismatch.String() + ". The value is stored wherever its anchor is defined.")
+	}
 	hash := sha512.New()
 	if tree.Metadata.MACOnlyEncrypted {
 		// We initialize with known set of bytes so that a MAC with this setting
 		// enabled is always different from a MAC with this setting disabled.
 		hash.Write(MACOnlyEncryptedInitialization)
+	}
+	// Anchor and alias names are cleartext structure that decides which
+	// plaintext is revealed, so they are authenticated even though they are not
+	// encrypted.
+	if err := WriteStructureToMAC(hash, tree.Branches); err != nil {
+		return "", fmt.Errorf("Could not write anchor structure to MAC: %s", err)
 	}
 	walk := func(branch TreeBranch) error {
 		_, err := branch.walkBranch(branch, make([]string, 0), make([][]string, 0), func(in interface{}, path []string, commentsStack [][]string) (interface{}, error) {
@@ -602,6 +813,9 @@ func (tree Tree) Decrypt(key []byte, cipher Cipher) (string, error) {
 		// We initialize with known set of bytes so that a MAC with this setting
 		// enabled is always different from a MAC with this setting disabled.
 		hash.Write(MACOnlyEncryptedInitialization)
+	}
+	if err := WriteStructureToMAC(hash, tree.Branches); err != nil {
+		return "", fmt.Errorf("Could not write anchor structure to MAC: %s", err)
 	}
 	walk := func(branch TreeBranch) error {
 		_, err := branch.walkBranch(branch, make([]string, 0), make([][]string, 0), func(in interface{}, path []string, commentsStack [][]string) (interface{}, error) {
@@ -1006,6 +1220,13 @@ func ToBytes(in interface{}) ([]byte, error) {
 // command for writing decrypted trees to various destinations. Should only be
 // used for outputting to data structures in code.
 func EmitAsMap(in TreeBranches) (map[string]interface{}, error) {
+	// Aliases are references that a plain map cannot express, so they are
+	// resolved to their values first.
+	resolved, err := ResolveAliases(in)
+	if err != nil {
+		return nil, err
+	}
+	in = resolved
 	data := map[string]interface{}{}
 
 	for _, branch := range in {

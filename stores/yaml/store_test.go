@@ -59,45 +59,43 @@ key3: &bar
 key4: *bar
 `)
 
+// ALIASES_BRANCHES reflects the anchor-preserving representation: the anchor
+// definitions stay wrapped in sops.Anchor and their uses stay sops.Alias
+// references instead of being expanded into independent copies.
 var ALIASES_BRANCHES = sops.TreeBranches{
 	sops.TreeBranch{
 		sops.TreeItem{
 			Key: "key1",
-			Value: []interface{}{
-				"foo",
+			Value: sops.Anchor{
+				Name: "foo",
+				Value: []interface{}{
+					"foo",
+				},
 			},
 		},
 		sops.TreeItem{
-			Key: "key2",
-			Value: []interface{}{
-				"foo",
-			},
+			Key:   "key2",
+			Value: sops.Alias{Name: "foo"},
 		},
 		sops.TreeItem{
 			Key: "key3",
-			Value: sops.TreeBranch{
-				sops.TreeItem{
-					Key:   "foo",
-					Value: "bar",
-				},
-				sops.TreeItem{
-					Key:   "baz",
-					Value: "bam",
+			Value: sops.Anchor{
+				Name: "bar",
+				Value: sops.TreeBranch{
+					sops.TreeItem{
+						Key:   "foo",
+						Value: "bar",
+					},
+					sops.TreeItem{
+						Key:   "baz",
+						Value: "bam",
+					},
 				},
 			},
 		},
 		sops.TreeItem{
-			Key: "key4",
-			Value: sops.TreeBranch{
-				sops.TreeItem{
-					Key:   "foo",
-					Value: "bar",
-				},
-				sops.TreeItem{
-					Key:   "baz",
-					Value: "bam",
-				},
-			},
+			Key:   "key4",
+			Value: sops.Alias{Name: "bar"},
 		},
 	},
 }
@@ -253,6 +251,280 @@ func TestLoadAliasesPlainFile(t *testing.T) {
 	branches, err := (&Store{}).LoadPlainFile(ALIASES)
 	assert.Nil(t, err)
 	assert.Equal(t, ALIASES_BRANCHES, branches)
+}
+
+// The anchor definitions and alias references must survive a load/emit cycle,
+// so that decrypting then re-parsing yields the same document structure.
+// Indentation and the document start marker are presentation details, so the
+// check is on the emitted anchor/alias syntax and on the re-parsed tree.
+func TestLoadAliasesRoundTrip(t *testing.T) {
+	branches, err := (&Store{}).LoadPlainFile(ALIASES)
+	assert.Nil(t, err)
+	bytes, err := (&Store{}).EmitPlainFile(branches)
+	assert.Nil(t, err)
+	assert.Contains(t, string(bytes), "key1: &foo")
+	assert.Contains(t, string(bytes), "key2: *foo")
+	assert.Contains(t, string(bytes), "key3: &bar")
+	assert.Contains(t, string(bytes), "key4: *bar")
+
+	reparsed, err := (&Store{}).LoadPlainFile(bytes)
+	assert.Nil(t, err)
+	assert.Equal(t, ALIASES_BRANCHES, reparsed)
+}
+
+var MERGE_KEYS = []byte(`defaults: &defaults
+    timeout: 10
+    retries: 3
+prod:
+    <<: *defaults
+    timeout: 20
+dev: *defaults
+`)
+
+var MERGE_KEYS_BRANCHES = sops.TreeBranches{
+	sops.TreeBranch{
+		sops.TreeItem{
+			Key: "defaults",
+			Value: sops.Anchor{
+				Name: "defaults",
+				Value: sops.TreeBranch{
+					sops.TreeItem{Key: "timeout", Value: 10},
+					sops.TreeItem{Key: "retries", Value: 3},
+				},
+			},
+		},
+		sops.TreeItem{
+			Key: "prod",
+			Value: sops.TreeBranch{
+				sops.TreeItem{
+					Key:   sops.MergeKey{},
+					Value: sops.Alias{Name: "defaults"},
+				},
+				sops.TreeItem{Key: "timeout", Value: 20},
+			},
+		},
+		sops.TreeItem{
+			Key:   "dev",
+			Value: sops.Alias{Name: "defaults"},
+		},
+	},
+}
+
+// A merge key has to stay a reference, not become a snapshot of the merged
+// mapping. This is the core behaviour change: previously "<<" was emitted as a
+// literal "!!merge <<" key whose value was an expanded copy.
+func TestMergeKeyRoundTrip(t *testing.T) {
+	branches, err := (&Store{}).LoadPlainFile(MERGE_KEYS)
+	assert.Nil(t, err)
+	assert.Equal(t, MERGE_KEYS_BRANCHES, branches)
+
+	bytes, err := (&Store{}).EmitPlainFile(branches)
+	assert.Nil(t, err)
+	assert.Equal(t, MERGE_KEYS, bytes)
+
+	reparsed, err := (&Store{}).LoadPlainFile(bytes)
+	assert.Nil(t, err)
+	assert.Equal(t, MERGE_KEYS_BRANCHES, reparsed)
+}
+
+var MERGE_KEYS_SEQUENCE = []byte(`first: &first
+    a: 1
+second: &second
+    b: 2
+combined:
+    <<: [*first, *second]
+    c: 3
+`)
+
+func TestMergeKeySequenceRoundTrip(t *testing.T) {
+	branches, err := (&Store{}).LoadPlainFile(MERGE_KEYS_SEQUENCE)
+	assert.Nil(t, err)
+	bytes, err := (&Store{}).EmitPlainFile(branches)
+	assert.Nil(t, err)
+	assert.Contains(t, string(bytes), "<<:")
+	assert.Contains(t, string(bytes), "*first")
+	assert.Contains(t, string(bytes), "*second")
+	reparsed, err := (&Store{}).LoadPlainFile(bytes)
+	assert.Nil(t, err)
+	assert.Equal(t, branches, reparsed)
+}
+
+// A quoted "<<" is an ordinary string key, not a merge key, and must stay one.
+func TestQuotedMergeKeyIsLiteral(t *testing.T) {
+	in := []byte("\"<<\": literal\n")
+	branches, err := (&Store{}).LoadPlainFile(in)
+	assert.Nil(t, err)
+	assert.Equal(t, sops.TreeBranches{sops.TreeBranch{
+		sops.TreeItem{Key: "<<", Value: "literal"},
+	}}, branches)
+	out, err := (&Store{}).EmitPlainFile(branches)
+	assert.Nil(t, err)
+	assert.Equal(t, in, out)
+}
+
+// Emitting an alias whose anchor is not defined before it would produce a
+// document that cannot be parsed again; refuse instead of writing it.
+func TestEmitDanglingAliasFails(t *testing.T) {
+	branches := sops.TreeBranches{sops.TreeBranch{
+		sops.TreeItem{Key: "ref", Value: sops.Alias{Name: "missing"}},
+	}}
+	_, err := (&Store{}).EmitPlainFile(branches)
+	assert.Error(t, err)
+}
+
+// Documents written by versions that expanded aliases contain an explicit
+// "!!merge <<" key holding an inline copy of the merged mapping. They must
+// still load (as a merge key whose value is an inline mapping) and be emitted
+// without corruption.
+var LEGACY_MERGE = []byte(`prod:
+    !!merge <<:
+        timeout: 10
+        retries: 3
+    timeout: 20
+`)
+
+func TestLoadLegacyMergeKey(t *testing.T) {
+	branches, err := (&Store{}).LoadPlainFile(LEGACY_MERGE)
+	assert.Nil(t, err)
+	assert.Equal(t, sops.TreeBranches{sops.TreeBranch{
+		sops.TreeItem{
+			Key: "prod",
+			Value: sops.TreeBranch{
+				sops.TreeItem{
+					Key: sops.MergeKey{},
+					Value: sops.TreeBranch{
+						sops.TreeItem{Key: "timeout", Value: 10},
+						sops.TreeItem{Key: "retries", Value: 3},
+					},
+				},
+				sops.TreeItem{Key: "timeout", Value: 20},
+			},
+		},
+	}}, branches)
+
+	// Emitting writes the merge key in its plain form; the document remains
+	// valid and re-parses to the same merged result.
+	out, err := (&Store{}).EmitPlainFile(branches)
+	assert.Nil(t, err)
+	reparsed, err := (&Store{}).LoadPlainFile(out)
+	assert.Nil(t, err)
+	assert.Equal(t, branches, reparsed)
+}
+
+var ANCHORED_SEQUENCE_ITEMS = []byte(`items:
+    - &item
+        a: 1
+    - *item
+    - &scalar
+      text
+    - *scalar
+`)
+
+func TestAnchorsInSequenceRoundTrip(t *testing.T) {
+	branches, err := (&Store{}).LoadPlainFile(ANCHORED_SEQUENCE_ITEMS)
+	assert.Nil(t, err)
+	assert.Equal(t, sops.TreeBranches{sops.TreeBranch{
+		sops.TreeItem{
+			Key: "items",
+			Value: []interface{}{
+				sops.Anchor{Name: "item", Value: sops.TreeBranch{
+					sops.TreeItem{Key: "a", Value: 1},
+				}},
+				sops.Alias{Name: "item"},
+				sops.Anchor{Name: "scalar", Value: "text"},
+				sops.Alias{Name: "scalar"},
+			},
+		},
+	}}, branches)
+
+	out, err := (&Store{}).EmitPlainFile(branches)
+	assert.Nil(t, err)
+	reparsed, err := (&Store{}).LoadPlainFile(out)
+	assert.Nil(t, err)
+	assert.Equal(t, branches, reparsed)
+}
+
+// Anything the store emits has to be loadable again. This guards the "every
+// emitted document re-parses" property directly, over the whole corpus of
+// anchor-bearing documents used in this file.
+func TestEveryEmittedDocumentReparses(t *testing.T) {
+	documents := [][]byte{
+		ALIASES,
+		MERGE_KEYS,
+		MERGE_KEYS_SEQUENCE,
+		ANCHORED_SEQUENCE_ITEMS,
+		LEGACY_MERGE,
+		[]byte("a: &x value # inline\nb: *x\n"),
+		[]byte("# head\na: &x value\nb: *x\n"),
+		[]byte("a: &x\n    # inner\n    k: v\nb: *x\n"),
+	}
+	for _, document := range documents {
+		branches, err := (&Store{}).LoadPlainFile(document)
+		assert.NoError(t, err)
+		out, err := (&Store{}).EmitPlainFile(branches)
+		assert.NoError(t, err)
+		_, err = (&Store{}).LoadPlainFile(out)
+		assert.NoError(t, err, "emitted document must re-parse:\n%s", out)
+	}
+}
+
+// A merge key may only hold a mapping or a sequence of mappings; anything else
+// would be emitted as invalid YAML.
+func TestEmitInvalidMergeKeyValueFails(t *testing.T) {
+	branches := sops.TreeBranches{sops.TreeBranch{
+		sops.TreeItem{
+			Key: "prod",
+			Value: sops.TreeBranch{
+				sops.TreeItem{Key: sops.MergeKey{}, Value: "not a mapping"},
+			},
+		},
+	}}
+	_, err := (&Store{}).EmitPlainFile(branches)
+	assert.Error(t, err)
+
+	valid := sops.TreeBranches{sops.TreeBranch{
+		sops.TreeItem{
+			Key: "base",
+			Value: sops.Anchor{Name: "base", Value: sops.TreeBranch{
+				sops.TreeItem{Key: "a", Value: 1},
+			}},
+		},
+		sops.TreeItem{
+			Key: "prod",
+			Value: sops.TreeBranch{
+				sops.TreeItem{Key: sops.MergeKey{}, Value: []interface{}{
+					sops.Alias{Name: "base"},
+				}},
+			},
+		},
+	}}
+	_, err = (&Store{}).EmitPlainFile(valid)
+	assert.NoError(t, err)
+}
+
+// A path component "<<" addresses the merge key instead of adding a second,
+// literal "<<" key (which would be a duplicate key and make the output
+// unparseable).
+func TestMergeKeyAddressableByPath(t *testing.T) {
+	branches := sops.TreeBranch{
+		sops.TreeItem{Key: "base", Value: sops.Anchor{Name: "base", Value: sops.TreeBranch{
+			sops.TreeItem{Key: "x", Value: 1},
+		}}},
+		sops.TreeItem{Key: "prod", Value: sops.TreeBranch{
+			sops.TreeItem{Key: sops.MergeKey{}, Value: sops.Alias{Name: "base"}},
+		}},
+	}
+
+	updated, changed := branches.Set([]interface{}{"prod", "<<", "x"}, 9)
+	assert.True(t, changed)
+	_, err := (&Store{}).EmitPlainFile([]sops.TreeBranch{updated})
+	assert.NoError(t, err)
+
+	removed, err := branches.Unset([]interface{}{"prod", "<<"})
+	assert.NoError(t, err)
+	out, err := (&Store{}).EmitPlainFile([]sops.TreeBranch{removed})
+	assert.NoError(t, err)
+	assert.NotContains(t, string(out), "<<")
 }
 
 func TestComment1(t *testing.T) {

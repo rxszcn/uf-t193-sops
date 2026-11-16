@@ -118,6 +118,10 @@ func Run(opts Opts) error {
 				return err
 			}
 
+			if err := common.PrepareTreeForStore(tree, opts.InputStore); err != nil {
+				return common.NewExitError(fmt.Sprintf("Could not marshal tree: %s", err), codes.ErrorDumpingTree)
+			}
+
 			err = common.EncryptTree(common.EncryptTreeOpts{
 				DataKey: dataKey,
 				Tree:    tree,
